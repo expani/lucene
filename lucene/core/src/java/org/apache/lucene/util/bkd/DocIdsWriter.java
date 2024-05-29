@@ -16,7 +16,6 @@
  */
 package org.apache.lucene.util.bkd;
 
-import java.io.IOException;
 import org.apache.lucene.index.PointValues.IntersectVisitor;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.store.DataOutput;
@@ -24,20 +23,26 @@ import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.DocBaseBitSetIterator;
 import org.apache.lucene.util.FixedBitSet;
 
+import java.io.IOException;
+import java.util.Arrays;
+
 final class DocIdsWriter {
 
   private static final byte CONTINUOUS_IDS = (byte) -2;
   private static final byte BITSET_IDS = (byte) -1;
   private static final byte DELTA_BPV_16 = (byte) 16;
   private static final byte BPV_24 = (byte) 24;
+
+  private static final byte BPV_PREFIX = (byte) -23;
   private static final byte BPV_32 = (byte) 32;
   // These signs are legacy, should no longer be used in the writing side.
   private static final byte LEGACY_DELTA_VINT = (byte) 0;
 
-  private final int[] scratch;
+  private final int[] scratch, scratch2;
 
   DocIdsWriter(int maxPointsInLeaf) {
     scratch = new int[maxPointsInLeaf];
+    scratch2 = new int[maxPointsInLeaf];
   }
 
   void writeDocIds(int[] docIds, int start, int count, DataOutput out) throws IOException {
@@ -46,9 +51,12 @@ final class DocIdsWriter {
     boolean strictlySorted = true;
     int min = docIds[0];
     int max = docIds[0];
+    int overallCommonBits = Integer.MAX_VALUE;
     for (int i = 1; i < count; ++i) {
       int last = docIds[start + i - 1];
       int current = docIds[start + i];
+      int currCommon = commonPrefixBits(current, last);
+      overallCommonBits = Math.min(overallCommonBits, currCommon);
       if (last >= current) {
         strictlySorted = false;
       }
@@ -92,40 +100,108 @@ final class DocIdsWriter {
       }
     } else {
       if (max <= 0xFFFFFF) {
-        out.writeByte(BPV_24);
-        // write them the same way we are reading them.
-        int i;
-        for (i = 0; i < count - 7; i += 8) {
-          int doc1 = docIds[start + i];
-          int doc2 = docIds[start + i + 1];
-          int doc3 = docIds[start + i + 2];
-          int doc4 = docIds[start + i + 3];
-          int doc5 = docIds[start + i + 4];
-          int doc6 = docIds[start + i + 5];
-          int doc7 = docIds[start + i + 6];
-          int doc8 = docIds[start + i + 7];
-          long l1 = (doc1 & 0xffffffL) << 40 | (doc2 & 0xffffffL) << 16 | ((doc3 >>> 8) & 0xffffL);
-          long l2 =
-              (doc3 & 0xffL) << 56
-                  | (doc4 & 0xffffffL) << 32
-                  | (doc5 & 0xffffffL) << 8
-                  | ((doc6 >> 16) & 0xffL);
-          long l3 = (doc6 & 0xffffL) << 48 | (doc7 & 0xffffffL) << 24 | (doc8 & 0xffffffL);
-          out.writeLong(l1);
-          out.writeLong(l2);
-          out.writeLong(l3);
-        }
-        for (; i < count; ++i) {
-          out.writeShort((short) (docIds[start + i] >>> 8));
-          out.writeByte((byte) docIds[start + i]);
+        if (overallCommonBits <= 8) {
+          out.writeByte(BPV_24);
+          // write them the same way we are reading them.
+          int i;
+          for (i = 0; i < count - 7; i += 8) {
+            int doc1 = docIds[start + i];
+            int doc2 = docIds[start + i + 1];
+            int doc3 = docIds[start + i + 2];
+            int doc4 = docIds[start + i + 3];
+            int doc5 = docIds[start + i + 4];
+            int doc6 = docIds[start + i + 5];
+            int doc7 = docIds[start + i + 6];
+            int doc8 = docIds[start + i + 7];
+            long l1 = (doc1 & 0xffffffL) << 40 | (doc2 & 0xffffffL) << 16 | ((doc3 >>> 8) & 0xffffL);
+            long l2 =
+                    (doc3 & 0xffL) << 56
+                            | (doc4 & 0xffffffL) << 32
+                            | (doc5 & 0xffffffL) << 8
+                            | ((doc6 >> 16) & 0xffL);
+            long l3 = (doc6 & 0xffffL) << 48 | (doc7 & 0xffffffL) << 24 | (doc8 & 0xffffffL);
+            out.writeLong(l1);
+            out.writeLong(l2);
+            out.writeLong(l3);
+          }
+          for (; i < count; ++i) {
+            out.writeShort((short) (docIds[start + i] >>> 8));
+            out.writeByte((byte) docIds[start + i]);
+          }
+        } else {
+          //System.out.println("Writing 24 bits docIds prefix with len as " + overallCommonBits);
+          writeIdsWithCommonPrefix(docIds, start, count, out, overallCommonBits);
         }
       } else {
-        out.writeByte(BPV_32);
-        for (int i = 0; i < count; i++) {
-          out.writeInt(docIds[start + i]);
+        if (overallCommonBits < 1) {
+          out.writeByte(BPV_32);
+          for (int i = 0; i < count; i++) {
+            out.writeInt(docIds[start + i]);
+          }
+        } else {
+          //System.out.println("Writing 32 bits docIds prefix with len as " + overallCommonBits);
+          writeIdsWithCommonPrefix(docIds, start, count, out, overallCommonBits);
         }
       }
     }
+  }
+
+  private void writeIdsWithCommonPrefix(int[] docIds, int start, int count, DataOutput out,
+                                               int totalCommonPrefixBits) throws IOException {
+
+    out.writeByte(BPV_PREFIX);
+
+    int uncommonBits = 32 - totalCommonPrefixBits;
+
+    // Will use less bits if kept at LSB
+    int commonPrefixLSB = docIds[0] >>> uncommonBits;
+
+    out.writeVInt(totalCommonPrefixBits);
+    out.writeVInt(commonPrefixLSB);
+
+    int numIntsRequiredForPacking = (uncommonBits * count) / 32;
+    numIntsRequiredForPacking += ((uncommonBits * count) % 32 == 0) ? 0 : 1;
+
+    int packedIntPtr = 0;
+    int usedBits = 0;
+    scratch[packedIntPtr] = 0;
+
+    for (int i = start; i < (start + count); i++) {
+      int prefixRemovedDocId = (docIds[i] << totalCommonPrefixBits) >>> totalCommonPrefixBits;
+      int freeBits = 32 - usedBits;
+      if (freeBits >= uncommonBits) {
+        scratch[packedIntPtr] = (prefixRemovedDocId << (32 - (uncommonBits + usedBits))) | scratch[packedIntPtr];
+        usedBits += uncommonBits;
+        if (usedBits == 32) {
+          packedIntPtr++;
+          scratch[packedIntPtr] = 0;
+          usedBits = 0;
+        }
+      } else {
+        scratch[packedIntPtr] = (prefixRemovedDocId >>> (uncommonBits - freeBits)) | scratch[packedIntPtr];
+        packedIntPtr++;
+        scratch[packedIntPtr] = 0;
+        scratch[packedIntPtr] = (prefixRemovedDocId << (totalCommonPrefixBits + freeBits)) | scratch[packedIntPtr];
+        usedBits = uncommonBits - freeBits;
+      }
+    }
+
+    for (int i = 0; i < numIntsRequiredForPacking; i++) {
+      out.writeInt(scratch[i]);
+    }
+
+//    System.out.printf("\nWritten leaf block having start %s with %s docIds and common prefix length %s as %s\n", start, count, totalCommonPrefixBits, numIntsRequiredForPacking);
+//
+//    int[] decompressArr = readIntsPrefixFromArr(scratch, count, totalCommonPrefixBits, commonPrefixLSB);
+//    boolean res = Arrays.equals(Arrays.copyOfRange(docIds, start, start + count), decompressArr);
+//
+//    if (!res) {
+//      System.out.printf("\nMismatch detected !!! Actual DocIds %s Decompressed DocIds %s Compressed Arr %s \n",
+//              Arrays.toString(docIds),
+//              Arrays.toString(decompressArr),
+//              Arrays.toString(Arrays.copyOfRange(scratch, 0, numIntsRequiredForPacking)));
+//    }
+
   }
 
   private static void writeIdsAsBitSet(int[] docIds, int start, int count, DataOutput out)
@@ -182,6 +258,9 @@ final class DocIdsWriter {
         break;
       case LEGACY_DELTA_VINT:
         readLegacyDeltaVInts(in, count, docIDs);
+        break;
+      case BPV_PREFIX:
+        readIntsPrefix(in, count, docIDs);
         break;
       default:
         throw new IOException("Unsupported number of bits per value: " + bpv);
@@ -285,6 +364,9 @@ final class DocIdsWriter {
       case LEGACY_DELTA_VINT:
         readLegacyDeltaVInts(in, count, visitor);
         break;
+      case BPV_PREFIX:
+        readIntsPrefix(in, count, visitor);
+        break;
       default:
         throw new IOException("Unsupported number of bits per value: " + bpv);
     }
@@ -350,4 +432,135 @@ final class DocIdsWriter {
       visitor.visit(scratch[i]);
     }
   }
+
+  private void readIntsPrefix(IndexInput in, int count, int[] docIds) throws IOException {
+
+    if (count == 0) {
+      return;
+    }
+
+    int commonPrefixLength = in.readVInt();
+    int commonPrefix = in.readVInt();
+
+    int uncommonBits = 32 - commonPrefixLength;
+
+    int numIntsRequiredForPacking = (uncommonBits * count) / 32;
+    numIntsRequiredForPacking += ((uncommonBits * count) % 32 == 0) ? 0 : 1;
+
+    in.readInts(scratch, 0, numIntsRequiredForPacking);
+
+    // Common Prefix is stored as by shifting fully towards LSB, but during reconstruction we need it shifted towards MSB
+    int commonPrefixMSB = commonPrefix << uncommonBits;
+
+    //System.out.printf("\nReading docIds having commonPrefix Len as %s and count as %s\n", commonPrefixLength, count);
+
+    int scratchPtr = 0;
+    int currentPackedInt = scratch[scratchPtr];
+    int availableBits = 32;
+    int totalIntsRead = 1;
+
+    for (int i = 0; i < count; i++) {
+      if (availableBits >= uncommonBits) {
+        int docIdUncommon = ((currentPackedInt >>> (availableBits - uncommonBits)) << commonPrefixLength) >>> commonPrefixLength;
+        docIds[i] = commonPrefixMSB | docIdUncommon;
+        availableBits -= uncommonBits;
+        if (availableBits == 0 && i < (count - 1)) {
+          currentPackedInt = scratch[++scratchPtr];
+          totalIntsRead++;
+          availableBits = 32;
+        }
+      } else {
+        int part1DocId = currentPackedInt << (32 - availableBits);
+        int bitsLeftToRead = uncommonBits - availableBits;
+
+        currentPackedInt = scratch[++scratchPtr];
+        totalIntsRead++;
+        int part2DocId = (currentPackedInt >>> (32 - bitsLeftToRead)) << (32 - (bitsLeftToRead + availableBits));
+
+        int uncommonDocId = (part1DocId | part2DocId) >>> commonPrefixLength;
+        docIds[i] = commonPrefixMSB | uncommonDocId;
+        availableBits = 32 - bitsLeftToRead;
+      }
+    }
+
+//    System.out.printf("\nTotal Ints read for %s docIds is %s having commonPrefix Len as %s with availableBits %s Array read %s\n",
+//            count, totalIntsRead, commonPrefixLength, availableBits, Arrays.toString(docIds));
+
+  }
+
+  private int[] readIntsPrefixFromArr(int[] packedDocIds, int count, int commonPrefixLength, int commonPrefix) {
+
+    if (count == 0) {
+      return new int[0];
+    }
+
+    int[] docIds = new int[count];
+
+    int uncommonBits = 32 - commonPrefixLength;
+    // Common Prefix is stored as by shifting fully towards LSB, but during reconstruction we need it shifted towards MSB
+    int commonPrefixMSB = commonPrefix << uncommonBits;
+
+    System.out.printf("\nReading docIds having commonPrefix Len as %s and count as %s\n", commonPrefixLength, count);
+
+    int prefixArrPtr = 0;
+    int currentPackedInt = packedDocIds[prefixArrPtr++];
+    int availableBits = 32;
+    int totalIntsRead = 1;
+
+    for (int i = 0; i < count; i++) {
+      if (availableBits == 0) {
+        currentPackedInt = packedDocIds[prefixArrPtr++];
+        totalIntsRead++;
+        availableBits = 32;
+      }
+      if (availableBits >= uncommonBits) {
+        int docIdUncommon = ((currentPackedInt >>> (availableBits - uncommonBits)) << commonPrefixLength) >>> commonPrefixLength;
+        docIds[i] = commonPrefixMSB | docIdUncommon;
+        availableBits -= uncommonBits;
+      } else {
+        int part1DocId = currentPackedInt << (32 - availableBits);
+        int bitsLeftToRead = uncommonBits - availableBits;
+
+        currentPackedInt = packedDocIds[prefixArrPtr++];
+        totalIntsRead++;
+        int part2DocId = (currentPackedInt >>> (32 - bitsLeftToRead)) << (32 - (bitsLeftToRead + availableBits));
+
+        int uncommonDocId = (part1DocId | part2DocId) >>> commonPrefixLength;
+        docIds[i] = commonPrefixMSB | uncommonDocId;
+        availableBits = 32 - bitsLeftToRead;
+      }
+    }
+
+    System.out.printf("\nTotal Ints read for checking is %s docIds is %s having commonPrefix Len as %s prefixArrPtr %s\n", count, totalIntsRead, commonPrefixLength, prefixArrPtr);
+
+    return docIds;
+
+  }
+
+  private void readIntsPrefix(IndexInput in, int count, IntersectVisitor visitor) throws IOException {
+     readIntsPrefix(in, count, scratch2);
+    for (int i = 0; i < count; i++) {
+      visitor.visit(scratch2[i]);
+    }
+  }
+
+  public static int commonPrefixBits(int a, int b) {
+    int commonBits = 0;
+
+    while (a != 0 || b != 0) {
+      int aBit = a & 0x80000000;
+      int bBit = b & 0x80000000;
+
+      if (aBit == bBit) {
+        commonBits++;
+      } else {
+        break;
+      }
+      a = a << 1;
+      b = b << 1;
+    }
+
+    return commonBits;
+  }
+
 }
