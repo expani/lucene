@@ -27,6 +27,7 @@ import org.apache.lucene.util.BitDocIdSet;
 import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.FixedBitSet;
+import org.apache.lucene.util.IntsRef;
 import org.apache.lucene.util.RoaringDocIdSet;
 import org.apache.lucene.util.SparseFixedBitSet;
 import org.junit.Ignore;
@@ -268,6 +269,13 @@ public abstract class BaseBitSetTestCase<T extends BitSet> extends LuceneTestCas
     }
 
     @Override
+    public void clearAll(IntsRef ref) {
+      for (int i = ref.offset; i < ref.offset + ref.length; i++) {
+        clear(ref.ints[i]);
+      }
+    }
+
+    @Override
     public boolean get(int index) {
       return bitSet.get(index);
     }
@@ -297,6 +305,13 @@ public abstract class BaseBitSetTestCase<T extends BitSet> extends LuceneTestCas
     @Override
     public void set(int i) {
       bitSet.set(i);
+    }
+
+    @Override
+    public void setAll(IntsRef ref) {
+      for (int i = ref.offset; i < ref.offset + ref.length; i++) {
+        set(ref.ints[i]);
+      }
     }
 
     @Override

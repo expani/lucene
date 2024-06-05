@@ -31,6 +31,7 @@ import org.apache.lucene.document.LongPoint;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.util.ArrayUtil;
 import org.apache.lucene.util.ArrayUtil.ByteArrayComparator;
+import org.apache.lucene.util.IntsRef;
 import org.apache.lucene.util.bkd.BKDConfig;
 
 /**
@@ -286,6 +287,12 @@ public abstract class PointValues {
      * should blindly accept the docID.
      */
     void visit(int docID) throws IOException;
+
+    default void visit(IntsRef intsRef) throws IOException {
+      for(int i = intsRef.offset; i < intsRef.offset + intsRef.length; i++) {
+        visit(intsRef.ints[i]);
+      }
+    }
 
     /**
      * Similar to {@link IntersectVisitor#visit(int)}, but a bulk visit and implements may have

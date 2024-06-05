@@ -244,6 +244,17 @@ public final class FixedBitSet extends BitSet {
   }
 
   @Override
+  public void setAll(IntsRef ref) {
+    for (int i = ref.offset; i < ref.offset + ref.length; i++) {
+      int index = ref.ints[i];
+      assert index >= 0 && index < numBits : "index=" + index + ", numBits=" + numBits;
+      int wordNum = index >> 6; // div 64
+      long bitmask = 1L << index;
+      bits[wordNum] |= bitmask;
+    }
+  }
+
+  @Override
   public boolean getAndSet(int index) {
     assert index >= 0 && index < numBits : "index=" + index + ", numBits=" + numBits;
     int wordNum = index >> 6; // div 64
@@ -257,8 +268,19 @@ public final class FixedBitSet extends BitSet {
   public void clear(int index) {
     assert index >= 0 && index < numBits : "index=" + index + ", numBits=" + numBits;
     int wordNum = index >> 6;
-    long bitmask = 1L << index;
+    long bitmask = 1L << index; // Similar to index % 64
     bits[wordNum] &= ~bitmask;
+  }
+
+  @Override
+  public void clearAll(IntsRef ref) {
+    for (int i = ref.offset; i < ref.offset + ref.length; i++) {
+      int index = ref.ints[i];
+      assert index >= 0 && index < numBits : "index=" + index + ", numBits=" + numBits;
+      int wordNum = index >> 6;
+      long bitmask = 1L << index;
+      bits[wordNum] &= ~bitmask;
+    }
   }
 
   public boolean getAndClear(int index) {

@@ -32,6 +32,7 @@ import org.apache.lucene.util.ArrayUtil.ByteArrayComparator;
 import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.DocIdSetBuilder;
 import org.apache.lucene.util.FixedBitSet;
+import org.apache.lucene.util.IntsRef;
 
 /**
  * Abstract class for range queries against single or multidimensional points such as {@link
@@ -181,6 +182,11 @@ public abstract class PointRangeQuery extends Query {
           }
 
           @Override
+          public void visit(IntsRef ref) {
+            adder.addAll(ref);
+          }
+
+          @Override
           public void visit(DocIdSetIterator iterator) throws IOException {
             adder.add(iterator);
           }
@@ -214,6 +220,12 @@ public abstract class PointRangeQuery extends Query {
           public void visit(int docID) {
             result.clear(docID);
             cost[0]--;
+          }
+
+          @Override
+          public void visit(IntsRef ref) {
+            result.clearAll(ref);
+            cost[0] -= ref.length;
           }
 
           @Override

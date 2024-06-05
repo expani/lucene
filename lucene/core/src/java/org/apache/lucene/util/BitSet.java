@@ -56,11 +56,15 @@ public abstract class BitSet implements Bits, Accountable {
   /** Set the bit at <code>i</code>. */
   public abstract void set(int i);
 
+  public abstract void setAll(IntsRef intsRef);
+
   /** Set the bit at <code>i</code>, returning <code>true</code> if it was previously set. */
   public abstract boolean getAndSet(int i);
 
   /** Clear the bit at <code>i</code>. */
   public abstract void clear(int i);
+
+  public abstract void clearAll(IntsRef ref);
 
   /**
    * Clears a range of bits.

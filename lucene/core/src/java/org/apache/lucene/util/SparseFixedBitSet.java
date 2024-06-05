@@ -205,6 +205,13 @@ public class SparseFixedBitSet extends BitSet {
     }
   }
 
+  @Override
+  public void setAll(IntsRef ref) {
+    for (int i = ref.offset; i < ref.offset + ref.length; i++) {
+      set(ref.ints[i]);
+    }
+  }
+
   private void insertBlock(int i4096, long i64bit, int i) {
     indices[i4096] = i64bit;
     assert bits[i4096] == null;
@@ -245,6 +252,17 @@ public class SparseFixedBitSet extends BitSet {
     final int i4096 = i >>> 12;
     final int i64 = i >>> 6;
     and(i4096, i64, ~(1L << i));
+  }
+
+  @Override
+  public void clearAll(IntsRef ref) {
+    for (int i = ref.offset; i < ref.offset + ref.length; i++) {
+      int index = ref.ints[i];
+      assert consistent(index);
+      final int i4096 = index >>> 12;
+      final int i64 = index >>> 6;
+      and(i4096, i64, ~(1L << index));
+    }
   }
 
   private void and(int i4096, int i64, long mask) {
