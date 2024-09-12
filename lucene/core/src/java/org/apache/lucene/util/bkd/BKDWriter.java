@@ -165,7 +165,7 @@ public class BKDWriter implements Closeable {
 
     // Maximum number of points we hold in memory at any time
     maxPointsSortInHeap = (int) ((maxMBSortInHeap * 1024 * 1024) / (config.bytesPerDoc()));
-    docIdsWriter = new DocIdsWriter(config.maxPointsInLeafNode());
+    docIdsWriter = new DocIdsWriter(config.maxPointsInLeafNode(), true);
     // Finally, we must be able to hold at least the leaf node in heap during build:
     if (maxPointsSortInHeap < config.maxPointsInLeafNode()) {
       throw new IllegalArgumentException(
@@ -1490,6 +1490,9 @@ public class BKDWriter implements Closeable {
   @Override
   public void close() throws IOException {
     finished = true;
+    if (docIdsWriter != null) {
+      docIdsWriter.close();
+    }
     if (tempInput != null) {
       // NOTE: this should only happen on exception, e.g. caller calls close w/o calling finish:
       try {

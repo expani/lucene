@@ -16,7 +16,19 @@
  */
 package org.apache.lucene.util.bkd;
 
+import java.io.BufferedWriter;
+import java.io.FileWriter;
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.nio.charset.Charset;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
+import java.util.Locale;
+import java.util.UUID;
 import org.apache.lucene.index.PointValues.IntersectVisitor;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.store.DataOutput;
@@ -35,7 +47,24 @@ final class DocIdsWriter {
   // These signs are legacy, should no longer be used in the writing side.
   private static final byte LEGACY_DELTA_VINT = (byte) 0;
 
+  private static final Path TEMP_DIR_FOR_DOCIDS;
+
+  static {
+    try {
+      DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss_", Locale.ROOT);
+      String formattedNow = ZonedDateTime.now(ZoneId.of("Asia/Kolkata")).format(formatter);
+      TEMP_DIR_FOR_DOCIDS = Files.createTempDirectory("docIds_" + formattedNow);
+      System.out.println("Temp directory where docIds will be written is " + TEMP_DIR_FOR_DOCIDS);
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
   private final int[] scratch;
+  private boolean createdForWriting = false;
+  private PrintWriter rawDocIdFileWriter;
+  private Path docIdsFile;
+  private long numDocIdSequencesWritten = 0L;
 
   /**
    * IntsRef to be used to iterate over the scratch buffer. A single instance is reused to avoid
@@ -53,8 +82,20 @@ final class DocIdsWriter {
     scratchIntsRef.offset = 0;
   }
 
-  DocIdsWriter(int maxPointsInLeaf) {
+  DocIdsWriter(int maxPointsInLeaf, Object... args) {
     scratch = new int[maxPointsInLeaf];
+    if (args != null && args.length > 0) {
+      this.createdForWriting = (boolean) args[0];
+      try {
+        docIdsFile = TEMP_DIR_FOR_DOCIDS.resolve(UUID.randomUUID() + "_" + System.nanoTime());
+        this.rawDocIdFileWriter =
+            new PrintWriter(
+                new BufferedWriter(
+                    new FileWriter(docIdsFile.toString(), Charset.defaultCharset())));
+      } catch (IOException e) {
+        throw new RuntimeException(e);
+      }
+    }
   }
 
   void writeDocIds(int[] docIds, int start, int count, DataOutput out) throws IOException {
@@ -109,6 +150,13 @@ final class DocIdsWriter {
       }
     } else {
       if (max <= 0xFFFFFF) {
+
+        // Check if this can be covered by BPV_21
+        if (max <= 0x001FFFFF && createdForWriting) {
+          numDocIdSequencesWritten++;
+          rawDocIdFileWriter.println(Arrays.toString(docIds).replace("[", "").replace("]", ""));
+        }
+
         out.writeByte(BPV_24);
         // write them the same way we are reading them.
         int i;
@@ -366,5 +414,21 @@ final class DocIdsWriter {
     scratchIntsRef.ints = scratch;
     scratchIntsRef.length = count;
     visitor.visit(scratchIntsRef);
+  }
+
+  public void close() {
+    if (createdForWriting && rawDocIdFileWriter != null) {
+      rawDocIdFileWriter.close();
+      if (numDocIdSequencesWritten == 0) {
+          try {
+             // To avoid creating a zero byte file.
+              Files.delete(docIdsFile);
+          } catch (IOException e) {
+              throw new RuntimeException(e);
+          }
+      } else {
+        System.out.println("Written " + numDocIdSequencesWritten + " docId sequences");
+      }
+    }
   }
 }
