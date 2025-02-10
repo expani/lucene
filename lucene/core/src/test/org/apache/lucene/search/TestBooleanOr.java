@@ -34,6 +34,7 @@ import org.apache.lucene.tests.util.LuceneTestCase;
 import org.apache.lucene.tests.util.TestUtil;
 import org.apache.lucene.util.ArrayUtil;
 import org.apache.lucene.util.FixedBitSet;
+import org.apache.lucene.util.IntArrayDocIdSet;
 
 public class TestBooleanOr extends LuceneTestCase {
 
