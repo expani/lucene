@@ -375,7 +375,9 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
         if (competitive == false) {
           return false;
         }
-      } else if (topValueSet) {
+      }
+      
+      if (topValueSet) {
         int result = compareMissingValueWithTopValue();
         // in reverse (desc) sort missingValue is competitive when it's smaller or equal to
         // topValue,
