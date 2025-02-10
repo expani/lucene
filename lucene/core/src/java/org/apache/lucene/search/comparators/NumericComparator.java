@@ -29,7 +29,10 @@ import org.apache.lucene.search.LeafFieldComparator;
 import org.apache.lucene.search.Pruning;
 import org.apache.lucene.search.Scorable;
 import org.apache.lucene.search.Scorer;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.ArrayUtil.ByteArrayComparator;
 import org.apache.lucene.util.DocIdSetBuilder;
+import org.apache.lucene.util.NumericUtils;
 
 /**
  * Abstract numeric comparator for comparing numeric values. This comparator provides a skipping
@@ -46,10 +49,10 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
   private static final int MIN_SKIP_INTERVAL = 32;
   private static final int MAX_SKIP_INTERVAL = 8192;
   protected final T missingValue;
-  private final long missingValueAsLong;
   protected final String field;
   protected final boolean reverse;
   private final int bytesCount; // how many bytes are used to encode this number
+  private final ByteArrayComparator bytesComparator;
 
   protected boolean topValueSet;
   protected boolean singleSort; // singleSort is true, if sort is based on a single sort field.
@@ -61,10 +64,10 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
       String field, T missingValue, boolean reverse, Pruning pruning, int bytesCount) {
     this.field = field;
     this.missingValue = missingValue;
-    this.missingValueAsLong = missingValueAsComparableLong();
     this.reverse = reverse;
     this.pruning = pruning;
     this.bytesCount = bytesCount;
+    this.bytesComparator = ArrayUtil.getUnsignedComparator(bytesCount);
   }
 
   @Override
@@ -82,14 +85,6 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
     pruning = Pruning.NONE;
   }
 
-  protected abstract long missingValueAsComparableLong();
-
-  /**
-   * Decode sortable bytes to long. It should be consistent with the codec that {@link PointValues}
-   * of this field is using.
-   */
-  protected abstract long sortableBytesToLong(byte[] bytes);
-
   /** Leaf comparator for {@link NumericComparator} that provides skipping functionality */
   public abstract class NumericLeafComparator implements LeafFieldComparator {
     private final LeafReaderContext context;
@@ -99,12 +94,8 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
     // if skipping functionality should be enabled on this segment
     private final boolean enableSkipping;
     private final int maxDoc;
-
-    /** According to {@link FieldComparator#setTopValue}, topValueSet is final in leafComparator */
-    private final boolean leafTopSet = topValueSet;
-
-    private long minValueAsLong = Long.MIN_VALUE;
-    private long maxValueAsLong = Long.MAX_VALUE;
+    private byte[] minValueAsBytes;
+    private byte[] maxValueAsBytes;
 
     private DocIdSetIterator competitiveIterator;
     private long iteratorCost = -1;
@@ -143,9 +134,6 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
         this.enableSkipping = true; // skipping is enabled when points are available
         this.maxDoc = context.reader().maxDoc();
         this.competitiveIterator = DocIdSetIterator.all(maxDoc);
-        if (leafTopSet) {
-          encodeTop();
-        }
       } else {
         this.pointTree = null;
         this.enableSkipping = false;
@@ -205,7 +193,7 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
     private void updateCompetitiveIterator() throws IOException {
       if (enableSkipping == false
           || hitsThresholdReached == false
-          || (leafTopSet == false && queueFull == false)) return;
+          || (queueFull == false && topValueSet == false)) return;
       // if some documents have missing points, check that missing values prohibits optimization
       if ((pointValues.getDocCount() < maxDoc) && isMissingValueCompetitive()) {
         return; // we can't filter out documents, as documents with missing values are competitive
@@ -217,9 +205,24 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
           && (updateCounter & (currentSkipInterval - 1)) != currentSkipInterval - 1) {
         return;
       }
-
-      if (queueFull) {
-        encodeBottom();
+      if (reverse == false) {
+        if (queueFull) { // bottom is available only when queue is full
+          maxValueAsBytes = maxValueAsBytes == null ? new byte[bytesCount] : maxValueAsBytes;
+          encodeBottom();
+        }
+        if (topValueSet) {
+          minValueAsBytes = minValueAsBytes == null ? new byte[bytesCount] : minValueAsBytes;
+          encodeTop();
+        }
+      } else {
+        if (queueFull) { // bottom is available only when queue is full
+          minValueAsBytes = minValueAsBytes == null ? new byte[bytesCount] : minValueAsBytes;
+          encodeBottom();
+        }
+        if (topValueSet) {
+          maxValueAsBytes = maxValueAsBytes == null ? new byte[bytesCount] : maxValueAsBytes;
+          encodeTop();
+        }
       }
 
       DocIdSetBuilder result = new DocIdSetBuilder(maxDoc);
@@ -245,32 +248,42 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
               if (docID <= maxDocVisited) {
                 return; // already visited or skipped
               }
-              long l = sortableBytesToLong(packedValue);
-              if (l >= minValueAsLong && l <= maxValueAsLong) {
-                adder.add(docID); // doc is competitive
+              if (maxValueAsBytes != null) {
+                int cmp = bytesComparator.compare(packedValue, 0, maxValueAsBytes, 0);
+
+                if (cmp > 0) return;
               }
+              if (minValueAsBytes != null) {
+                int cmp = bytesComparator.compare(packedValue, 0, minValueAsBytes, 0);
+
+                if (cmp < 0) return;
+              }
+              adder.add(docID); // doc is competitive
             }
 
             @Override
             public PointValues.Relation compare(byte[] minPackedValue, byte[] maxPackedValue) {
-              long min = sortableBytesToLong(minPackedValue);
-              long max = sortableBytesToLong(maxPackedValue);
-
-              if (min > maxValueAsLong || max < minValueAsLong) {
+              if (maxValueAsBytes != null) {
+                int cmp = bytesComparator.compare(minPackedValue, 0, maxValueAsBytes, 0);
                 // 1. cmp ==0 and pruning==Pruning.GREATER_THAN_OR_EQUAL_TO : if the sort is
-                // ascending then maxValueAsLong is bottom's next less value, so it is competitive
-                // 2. cmp ==0 and pruning==Pruning.GREATER_THAN: maxValueAsLong equals to
+                // ascending then maxValueAsBytes is bottom's next less value, so it is competitive
+                // 2. cmp ==0 and pruning==Pruning.GREATER_THAN: maxValueAsBytes equals to
                 // bottom, but there are multiple comparators, so it could be competitive
-                return PointValues.Relation.CELL_OUTSIDE_QUERY;
+                if (cmp > 0) return PointValues.Relation.CELL_OUTSIDE_QUERY;
               }
-
-              if (min < minValueAsLong || max > maxValueAsLong) {
+              if (minValueAsBytes != null) {
+                int cmp = bytesComparator.compare(maxPackedValue, 0, minValueAsBytes, 0);
+                if (cmp < 0) return PointValues.Relation.CELL_OUTSIDE_QUERY;
+              }
+              if ((maxValueAsBytes != null
+                      && bytesComparator.compare(maxPackedValue, 0, maxValueAsBytes, 0) > 0)
+                  || (minValueAsBytes != null
+                      && bytesComparator.compare(minPackedValue, 0, minValueAsBytes, 0) < 0)) {
                 return PointValues.Relation.CELL_CROSSES_QUERY;
               }
               return PointValues.Relation.CELL_INSIDE_QUERY;
             }
           };
-
       final long threshold = iteratorCost >>> 3;
 
       if (PointValues.isEstimatedPointCountGreaterThanOrEqualTo(visitor, pointTree, threshold)) {
@@ -308,46 +321,42 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
 
     /**
      * If {@link NumericComparator#pruning} equals {@link Pruning#GREATER_THAN_OR_EQUAL_TO}, we
-     * could better tune the {@link NumericLeafComparator#maxValueAsLong}/{@link
-     * NumericLeafComparator#minValueAsLong}. For instance, if the sort is ascending and bottom
+     * could better tune the {@link NumericLeafComparator#maxValueAsBytes}/{@link
+     * NumericLeafComparator#minValueAsBytes}. For instance, if the sort is ascending and bottom
      * value is 5, we will use a range on [MIN_VALUE, 4].
      */
     private void encodeBottom() {
       if (reverse == false) {
-        maxValueAsLong = bottomAsComparableLong();
-        if (pruning == Pruning.GREATER_THAN_OR_EQUAL_TO && maxValueAsLong != Long.MIN_VALUE) {
-          maxValueAsLong--;
+        encodeBottom(maxValueAsBytes);
+        if (pruning == Pruning.GREATER_THAN_OR_EQUAL_TO) {
+          NumericUtils.nextDown(maxValueAsBytes);
         }
       } else {
-        minValueAsLong = bottomAsComparableLong();
-        if (pruning == Pruning.GREATER_THAN_OR_EQUAL_TO && minValueAsLong != Long.MAX_VALUE) {
-          minValueAsLong++;
+        encodeBottom(minValueAsBytes);
+        if (pruning == Pruning.GREATER_THAN_OR_EQUAL_TO) {
+          NumericUtils.nextUp(minValueAsBytes);
         }
       }
     }
 
     /**
      * If {@link NumericComparator#pruning} equals {@link Pruning#GREATER_THAN_OR_EQUAL_TO}, we
-     * could better tune the {@link NumericLeafComparator#minValueAsLong}/{@link
-     * NumericLeafComparator#minValueAsLong}. For instance, if the sort is ascending and top value
+     * could better tune the {@link NumericLeafComparator#maxValueAsBytes}/{@link
+     * NumericLeafComparator#minValueAsBytes}. For instance, if the sort is ascending and top value
      * is 3, we will use a range on [4, MAX_VALUE].
      */
     private void encodeTop() {
       if (reverse == false) {
-        minValueAsLong = topAsComparableLong();
-        if (singleSort
-            && pruning == Pruning.GREATER_THAN_OR_EQUAL_TO
-            && queueFull
-            && minValueAsLong != Long.MAX_VALUE) {
-          minValueAsLong++;
+        encodeTop(minValueAsBytes);
+        // we could not tune the top value in page search
+        if (singleSort && pruning == Pruning.GREATER_THAN_OR_EQUAL_TO && queueFull) {
+          NumericUtils.nextUp(minValueAsBytes);
         }
       } else {
-        maxValueAsLong = topAsComparableLong();
-        if (singleSort
-            && pruning == Pruning.GREATER_THAN_OR_EQUAL_TO
-            && queueFull
-            && maxValueAsLong != Long.MIN_VALUE) {
-          maxValueAsLong--;
+        encodeTop(maxValueAsBytes);
+        // we could not tune the top value in page search
+        if (singleSort && pruning == Pruning.GREATER_THAN_OR_EQUAL_TO && queueFull) {
+          NumericUtils.nextDown(maxValueAsBytes);
         }
       }
     }
@@ -356,7 +365,7 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
       // if queue is full, compare with bottom first,
       // if competitive, then check if we can compare with topValue
       if (queueFull) {
-        int result = Long.compare(missingValueAsLong, bottomAsComparableLong());
+        int result = compareMissingValueWithBottomValue();
         // in reverse (desc) sort missingValue is competitive when it's greater or equal to bottom,
         // in asc sort missingValue is competitive when it's smaller or equal to bottom
         final boolean competitive =
@@ -366,10 +375,8 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
         if (competitive == false) {
           return false;
         }
-      }
-
-      if (leafTopSet) {
-        int result = Long.compare(missingValueAsLong, topAsComparableLong());
+      } else if (topValueSet) {
+        int result = compareMissingValueWithTopValue();
         // in reverse (desc) sort missingValue is competitive when it's smaller or equal to
         // topValue,
         // in asc sort missingValue is competitive when it's greater or equal to topValue
@@ -408,8 +415,18 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
       };
     }
 
-    protected abstract long bottomAsComparableLong();
+    /**
+     * in ascending sort, missing value is competitive when it is less or equal(maybe there are two
+     * or more comparators) than bottom value. if there is only one comparator(See {@link
+     * Pruning#GREATER_THAN_OR_EQUAL_TO}), missing value is competitive only when it is less than
+     * bottom value. vice versa in descending sort.
+     */
+    protected abstract int compareMissingValueWithTopValue();
 
-    protected abstract long topAsComparableLong();
+    protected abstract int compareMissingValueWithBottomValue();
+
+    protected abstract void encodeBottom(byte[] packedValue);
+
+    protected abstract void encodeTop(byte[] packedValue);
   }
 }

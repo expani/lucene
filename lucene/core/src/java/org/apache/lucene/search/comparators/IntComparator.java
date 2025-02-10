@@ -18,10 +18,10 @@
 package org.apache.lucene.search.comparators;
 
 import java.io.IOException;
+import org.apache.lucene.document.IntPoint;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.search.LeafFieldComparator;
 import org.apache.lucene.search.Pruning;
-import org.apache.lucene.util.NumericUtils;
 
 /**
  * Comparator based on {@link Integer#compare} for {@code numHits}. This comparator provides a
@@ -52,16 +52,6 @@ public class IntComparator extends NumericComparator<Integer> {
   @Override
   public Integer value(int slot) {
     return Integer.valueOf(values[slot]);
-  }
-
-  @Override
-  protected long missingValueAsComparableLong() {
-    return missingValue;
-  }
-
-  @Override
-  protected long sortableBytesToLong(byte[] bytes) {
-    return NumericUtils.sortableBytesToInt(bytes, 0);
   }
 
   @Override
@@ -107,13 +97,23 @@ public class IntComparator extends NumericComparator<Integer> {
     }
 
     @Override
-    protected long bottomAsComparableLong() {
-      return bottom;
+    protected int compareMissingValueWithBottomValue() {
+      return Integer.compare(missingValue, bottom);
     }
 
     @Override
-    protected long topAsComparableLong() {
-      return topValue;
+    protected int compareMissingValueWithTopValue() {
+      return Integer.compare(missingValue, topValue);
+    }
+
+    @Override
+    protected void encodeBottom(byte[] packedValue) {
+      IntPoint.encodeDimension(bottom, packedValue, 0);
+    }
+
+    @Override
+    protected void encodeTop(byte[] packedValue) {
+      IntPoint.encodeDimension(topValue, packedValue, 0);
     }
   }
 }
