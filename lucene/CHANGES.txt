@@ -39,8 +39,7 @@ Improvements
 
 Optimizations
 ---------------------
-
-* GITHUB#13828: Reduce long[] array allocation for bitset in readBitSetIterator. (Zhang Chao)
+(No changes)
 
 * GITHUB#13800: MaxScoreBulkScorer now recomputes scorer partitions when the
   minimum competitive allows for a more favorable partitioning. (Adrien Grand)
